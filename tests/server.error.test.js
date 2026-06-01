@@ -104,15 +104,66 @@ function track(child) {
 }
 
 /**
- * Force-terminate any tracked child that is still running, then clear the
- * registry. A Node child that exited normally reports a numeric `exitCode`;
- * one terminated by signal reports `signalCode` (e.g. 'SIGTERM'). A child that
- * is still alive reports BOTH as `null` — only those are killed here, so this
- * never double-signals an already-stopped process.
+ * Await a child's termination and resolve once it has genuinely exited, or after
+ * a bounded fallback timeout so a stuck reap can NEVER hang teardown. Resolves
+ * (never rejects) — cleanup is fire-and-forget safe. Mirrors the await-on-'exit'
+ * discipline of `stopServer()` in `tests/helpers/serverProcess.js`.
+ *
+ * @param {import('child_process').ChildProcess} child
+ * @param {number} [timeoutMs=5000]
+ * @returns {Promise<void>}
+ */
+function awaitChildExit(child, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    // Already terminated: a normal exit reports a numeric `exitCode`; a
+    // signal-kill reports `signalCode`. Either means there is nothing to await.
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+
+    // Safety net: never block teardown indefinitely if the 'exit' somehow does
+    // not arrive. The timer is unref'd so it cannot itself keep Node alive.
+    const timer = setTimeout(finish, timeoutMs);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+
+    child.once('exit', finish);
+  });
+}
+
+/**
+ * Force-terminate any tracked child that is still running, AWAIT its exit, then
+ * clear the registry. A Node child that exited normally reports a numeric
+ * `exitCode`; one terminated by signal reports `signalCode` (e.g. 'SIGTERM'). A
+ * child that is still alive reports BOTH as `null` — only those are killed here,
+ * so this never double-signals an already-stopped process.
+ *
+ * Deterministic teardown (AAP §0.7.2, §0.10.3): after sending SIGKILL we WAIT
+ * for the child's 'exit' (bounded) before returning, because the OS only
+ * reclaims the process's listening socket on port 3000 once the process is
+ * actually gone. Without that wait the next test/suite could begin while a
+ * just-killed process still momentarily holds the port — the exact contention
+ * this safety net exists to prevent. When a survivor was actually reaped we
+ * additionally poll briefly until port 3000 is observably refused, absorbing any
+ * residual OS port-release latency. Both steps run ONLY on the (rare) failure
+ * path where a survivor existed, so the green path incurs no added latency.
  *
  * @returns {Promise<void>}
  */
 async function killSurvivors() {
+  let killedAny = false;
   while (spawnedChildren.length > 0) {
     const child = spawnedChildren.pop();
     if (!child) {
@@ -125,6 +176,22 @@ async function killSurvivors() {
       } catch (_) {
         // Process vanished between the liveness check and the kill — ignore.
       }
+      // Block until the killed child is truly gone (bounded) so its port-3000
+      // socket is released before this cleanup returns.
+      await awaitChildExit(child);
+      killedAny = true;
+    }
+  }
+
+  // Only when a survivor was actually reaped do we confirm the port is free
+  // again, tolerating brief OS port-release latency. Bounded so cleanup can
+  // never hang; `connectExpectingError` resolves a sentinel rather than throwing.
+  if (killedAny) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if ((await connectExpectingError(HOST, PORT)) === 'ECONNREFUSED') {
+        break;
+      }
+      await delay(100);
     }
   }
 }
@@ -358,12 +425,30 @@ describe('server.js error handling', () => {
       });
     }
 
-    // The second instance self-terminates — await its exit status.
-    const { code } = await waitForExit(second);
+    // The second instance self-terminates — await its FULL exit status so the
+    // safety sentinels can be rejected BEFORE any success branch is evaluated.
+    const { code, timedOut, error } = await waitForExit(second);
 
-    // Failure is proven by a non-zero exit code OR an EADDRINUSE stderr message.
+    // GUARD — reject the safety sentinels first so a hung or un-spawnable child
+    // can NEVER satisfy this test. `waitForExit` resolves `{ timedOut: true }`
+    // (with `code: null`) if the child never exits within budget, and
+    // `{ error }` if the spawn itself failed (e.g. 'node' missing). Neither
+    // proves a port-bind failure — and the timeout sentinel's `code: null` is
+    // exactly what a naive `code !== 0` check wrongly accepted (null !== 0).
+    expect(timedOut).not.toBe(true);
+    expect(error).toBeUndefined();
+
+    // The child must have genuinely terminated with a REAL (non-null) exit code.
+    // After the guard above a timeout is impossible, but requiring a non-null
+    // code keeps the non-zero-exit branch below honest (a signal-kill would
+    // surface `code === null`). Empirically the second instance self-exits with
+    // code 1 because `server.js` registers no `'error'` handler.
+    expect(code).not.toBeNull();
+
+    // Failure is proven by a NON-ZERO exit code OR an EADDRINUSE stderr message.
     // Empirically BOTH hold (code === 1 AND stderr includes 'EADDRINUSE'); the
-    // OR keeps the assertion robust against any stderr-capture timing race.
+    // OR keeps the assertion robust against any stderr-capture timing race, while
+    // the guards above ensure a clean exit (code 0) or a non-exit cannot pass.
     expect(code !== 0 || /EADDRINUSE/.test(secondStderr)).toBe(true);
 
     // The primary remained healthy throughout the contention — its native
